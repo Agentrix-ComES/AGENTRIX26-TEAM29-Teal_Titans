@@ -4,8 +4,13 @@ Every node is imported here ALREADY (scaffold contract), so members never edit t
 file when they implement their node — they just fill in their own nodes/<name>.py.
 
 Graph topology:
-  START → planner → knowledge → dependency → eligibility → checklist
+  START → planner → knowledge → dependency → run_eligibility → run_checklist
         → [interrupt_before=document] → document → form → reminder → END
+
+The eligibility/checklist nodes are registered as "run_eligibility"/"run_checklist"
+because a LangGraph node name may not collide with a GraphState key, and both
+"eligibility" and "checklist" are state keys. runner.py strips the "run_" prefix
+when emitting SSE so the stream still reports clean agent names.
 
 The interrupt before "document" pauses the run waiting for a document upload or
 user answer.  Resuming re-enters at the document node with the updated state.
@@ -33,8 +38,8 @@ def build_graph(checkpointer=None):
     g.add_node("planner", planner)
     g.add_node("knowledge", knowledge)
     g.add_node("dependency", dependency)
-    g.add_node("eligibility", eligibility)
-    g.add_node("checklist", checklist)
+    g.add_node("run_eligibility", eligibility)   # "eligibility" is a GraphState key
+    g.add_node("run_checklist", checklist)       # "checklist" is a GraphState key
     g.add_node("document", document)
     g.add_node("form", form)
     g.add_node("reminder", reminder)
@@ -42,11 +47,11 @@ def build_graph(checkpointer=None):
     g.add_edge(START, "planner")
     g.add_edge("planner", "knowledge")
     g.add_edge("knowledge", "dependency")
-    g.add_edge("dependency", "eligibility")
-    g.add_edge("eligibility", "checklist")
+    g.add_edge("dependency", "run_eligibility")
+    g.add_edge("run_eligibility", "run_checklist")
     # After checklist the graph pauses (interrupt_before="document") waiting
     # for the user to upload files or answer questions.  Resume continues here.
-    g.add_edge("checklist", "document")
+    g.add_edge("run_checklist", "document")
     g.add_edge("document", "form")
     g.add_edge("form", "reminder")
     g.add_edge("reminder", END)

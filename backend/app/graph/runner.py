@@ -25,13 +25,22 @@ from app.schemas.run import RunEvent
 # ── Checkpointer singleton ────────────────────────────────────────────────────
 
 _checkpointer = None
+_cp_pool = None            # kept alive for the process lifetime (see below)
 _cp_lock = asyncio.Lock()
 _cp_tried = False          # avoid retrying a failed init on every request
 
 
 async def _ensure_checkpointer():
-    """Initialise the AsyncPostgresSaver once; return None on failure."""
-    global _checkpointer, _cp_tried
+    """Initialise the AsyncPostgresSaver once; return None on failure.
+
+    Owns a process-lifetime AsyncConnectionPool. The previous implementation used
+    ``AsyncPostgresSaver.from_conn_string(...)`` and discarded the returned context
+    manager, so its connection was closed when the local was garbage-collected —
+    the run then died mid-stream with "the connection is closed". A pool stored in
+    a module global stays open, survives dropped connections, and is safe across
+    concurrent requests.
+    """
+    global _checkpointer, _cp_pool, _cp_tried
     if _checkpointer is not None or _cp_tried:
         return _checkpointer
     async with _cp_lock:
@@ -40,15 +49,30 @@ async def _ensure_checkpointer():
         _cp_tried = True
         try:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+
             from app.config import settings
 
-            # psycopg3 needs a plain postgresql:// URL (not SQLAlchemy-prefixed)
+            # psycopg3 needs a plain postgresql:// URL (not SQLAlchemy-prefixed).
             db_url = settings.database_url.replace("postgresql+psycopg://", "postgresql://")
-            cm = AsyncPostgresSaver.from_conn_string(db_url)
-            checkpointer = await cm.__aenter__()
+            # AsyncPostgresSaver requires autocommit + dict_row; prepare_threshold=0
+            # keeps it compatible with transaction-pooling proxies (Neon -pooler / PgBouncer).
+            pool = AsyncConnectionPool(
+                conninfo=db_url,
+                max_size=10,
+                open=False,
+                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            )
+            await pool.open(wait=True)
+            checkpointer = AsyncPostgresSaver(pool)
             await checkpointer.setup()
+            _cp_pool = pool
             _checkpointer = checkpointer
         except Exception:
+            if _cp_pool is not None:
+                await _cp_pool.close()
+            _cp_pool = None
             _checkpointer = None
     return _checkpointer
 
@@ -69,8 +93,12 @@ async def _get_graph():
 
 # ── SSE streaming ─────────────────────────────────────────────────────────────
 
+# Graph node names. "run_eligibility"/"run_checklist" carry a prefix because a
+# LangGraph node name may not collide with a GraphState key (see builder.py); the
+# prefix is stripped below so SSE consumers still see "eligibility"/"checklist".
 _NODE_NAMES = frozenset(
-    ["planner", "knowledge", "dependency", "eligibility", "checklist", "document", "form", "reminder"]
+    ["planner", "knowledge", "dependency", "run_eligibility", "run_checklist",
+     "document", "form", "reminder"]
 )
 
 
@@ -104,9 +132,10 @@ async def run_case(
             for node_name, node_output in chunk.items():
                 if node_name not in _NODE_NAMES:
                     continue
-                yield RunEvent(agent=node_name, status="started").to_sse()
+                agent = node_name.removeprefix("run_")  # clean SSE name
+                yield RunEvent(agent=agent, status="started").to_sse()
                 yield RunEvent(
-                    agent=node_name,
+                    agent=agent,
                     status="completed",
                     payload=node_output if isinstance(node_output, dict) else {},
                 ).to_sse()
