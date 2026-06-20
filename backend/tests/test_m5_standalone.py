@@ -104,15 +104,22 @@ class TestDocumentSchemas:
 
 
 class TestGeminiVision:
-    """Tests for gemini_vision.py with Gemini API mocked out."""
+    """Tests for gemini_vision.py with Gemini API mocked out.
+
+    NOTE: gemini_vision.py imports `google.generativeai` lazily *inside* each
+    function, so the patch target is the real `google.generativeai.GenerativeModel`
+    (not `app.llm.gemini_vision.genai`). The API key is read from the cached
+    `settings` singleton, so we patch `app.llm.gemini_vision.settings.gemini_api_key`
+    rather than os.environ (which is only read once at import time).
+    """
 
     def _make_mock_response(self, payload: dict) -> MagicMock:
         mock_resp = MagicMock()
         mock_resp.text = json.dumps(payload)
         return mock_resp
 
-    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
-    @patch("app.llm.gemini_vision.genai.GenerativeModel")
+    @patch("app.llm.gemini_vision.settings.gemini_api_key", "test-key")
+    @patch("google.generativeai.GenerativeModel")
     @pytest.mark.asyncio
     async def test_analyze_document_accepted(self, mock_model_cls):
         from app.llm.gemini_vision import analyze_document
@@ -135,8 +142,8 @@ class TestGeminiVision:
         assert result.issues == []
         assert result.confidence == 0.96
 
-    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
-    @patch("app.llm.gemini_vision.genai.GenerativeModel")
+    @patch("app.llm.gemini_vision.settings.gemini_api_key", "test-key")
+    @patch("google.generativeai.GenerativeModel")
     @pytest.mark.asyncio
     async def test_analyze_document_rejected_blurry(self, mock_model_cls):
         from app.llm.gemini_vision import analyze_document
@@ -158,8 +165,8 @@ class TestGeminiVision:
         assert "blurry" in result.issues[0].lower()
         assert result.confidence == 0.30
 
-    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
-    @patch("app.llm.gemini_vision.genai.GenerativeModel")
+    @patch("app.llm.gemini_vision.settings.gemini_api_key", "test-key")
+    @patch("google.generativeai.GenerativeModel")
     @pytest.mark.asyncio
     async def test_analyze_document_handles_malformed_json(self, mock_model_cls):
         """If Gemini returns non-JSON, we should get a safe fallback result."""
@@ -177,7 +184,7 @@ class TestGeminiVision:
         assert result.detected_type == DocumentType.UNKNOWN
         assert len(result.issues) > 0
 
-    @patch.dict("os.environ", {}, clear=True)
+    @patch("app.llm.gemini_vision.settings.gemini_api_key", "")
     @pytest.mark.asyncio
     async def test_analyze_document_raises_when_no_api_key(self):
         from app.llm.gemini_vision import GeminiVisionError, analyze_document
@@ -185,8 +192,8 @@ class TestGeminiVision:
         with pytest.raises(GeminiVisionError, match="GEMINI_API_KEY"):
             await analyze_document(b"bytes", expected_name="NIC")
 
-    @patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
-    @patch("app.llm.gemini_vision.genai.GenerativeModel")
+    @patch("app.llm.gemini_vision.settings.gemini_api_key", "test-key")
+    @patch("google.generativeai.GenerativeModel")
     @pytest.mark.asyncio
     async def test_analyze_document_quota_exceeded(self, mock_model_cls):
         from google.api_core.exceptions import ResourceExhausted
@@ -209,14 +216,16 @@ class TestGeminiVision:
 class TestOCR:
     """Tests for ocr.py with pytesseract mocked."""
 
+    # `_preprocess_image` runs real Pillow (ImageEnhance/ImageFilter), which cannot
+    # operate on a MagicMock, so we patch it to a pass-through. The unit under test
+    # is the OCR text extraction + classification logic, not Pillow itself.
     @patch("app.documents.ocr.pytesseract.image_to_string")
+    @patch("app.documents.ocr._preprocess_image", side_effect=lambda image: image)
     @patch("app.documents.ocr.Image.open")
-    def test_extract_text_returns_string(self, mock_open, mock_ocr):
+    def test_extract_text_returns_string(self, mock_open, mock_pre, mock_ocr):
         from app.documents.ocr import extract_text
 
-        mock_image = MagicMock()
-        mock_image.convert.return_value.size = (800, 600)
-        mock_open.return_value = mock_image
+        mock_open.return_value = MagicMock()
         mock_ocr.return_value = "National Identity Card Kamal Perera 199012345678"
 
         result = extract_text(b"fake-image-bytes")
@@ -224,13 +233,13 @@ class TestOCR:
         assert "National Identity Card" in result
 
     @patch("app.documents.ocr.pytesseract.image_to_string")
+    @patch("app.documents.ocr._preprocess_image", side_effect=lambda image: image)
     @patch("app.documents.ocr.Image.open")
-    def test_classify_nic(self, mock_open, mock_ocr):
+    def test_classify_nic(self, mock_open, mock_pre, mock_ocr):
         from app.documents.ocr import classify_from_ocr_text
         from app.schemas.document import DocumentType
 
         mock_open.return_value = MagicMock()
-        mock_open.return_value.convert.return_value.size = (800, 600)
         mock_ocr.return_value = "National Identity Card Sri Lanka NIC Number 199012345678"
 
         result = classify_from_ocr_text(b"fake-bytes", expected_name="NIC")
@@ -239,8 +248,9 @@ class TestOCR:
         assert result.confidence > 0
 
     @patch("app.documents.ocr.pytesseract.image_to_string")
+    @patch("app.documents.ocr._preprocess_image", side_effect=lambda image: image)
     @patch("app.documents.ocr.Image.open")
-    def test_classify_passport(self, mock_open, mock_ocr):
+    def test_classify_passport(self, mock_open, mock_pre, mock_ocr):
         from app.documents.ocr import classify_from_ocr_text
         from app.schemas.document import DocumentType
 
@@ -252,8 +262,9 @@ class TestOCR:
         assert result.detected_type == DocumentType.PASSPORT
 
     @patch("app.documents.ocr.pytesseract.image_to_string")
+    @patch("app.documents.ocr._preprocess_image", side_effect=lambda image: image)
     @patch("app.documents.ocr.Image.open")
-    def test_blurry_image_flagged(self, mock_open, mock_ocr):
+    def test_blurry_image_flagged(self, mock_open, mock_pre, mock_ocr):
         from app.documents.ocr import classify_from_ocr_text
 
         mock_open.return_value = MagicMock()
@@ -277,17 +288,17 @@ class TestOCR:
 
 
 # ---------------------------------------------------------------------------
-# Storage tests (Supabase mocked)
+# Storage tests (local-filesystem implementation)
+#
+# storage.py is the hackathon local-fs backend (write under settings.storage_dir,
+# file:// URLs). Each test points settings.storage_dir at a pytest tmp_path so the
+# real read/write/delete paths are exercised without touching the repo.
 # ---------------------------------------------------------------------------
 
 
 class TestStorage:
-    """Tests for storage.py with Supabase SDK mocked."""
+    """Tests for storage.py (local filesystem backend)."""
 
-    @patch.dict(
-        "os.environ",
-        {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_SERVICE_KEY": "test-key"},
-    )
     def test_build_storage_path_structure(self):
         from app.documents.storage import build_storage_path
 
@@ -301,10 +312,6 @@ class TestStorage:
         # Spaces should be replaced with underscores
         assert " " not in path
 
-    @patch.dict(
-        "os.environ",
-        {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_SERVICE_KEY": "test-key"},
-    )
     def test_build_storage_path_unique(self):
         from app.documents.storage import build_storage_path
 
@@ -313,72 +320,46 @@ class TestStorage:
 
         assert path1 != path2  # UUID prefix ensures uniqueness
 
-    @patch("app.documents.storage._get_client")
-    @patch.dict(
-        "os.environ",
-        {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_SERVICE_KEY": "test-key"},
-    )
     @pytest.mark.asyncio
-    async def test_upload_file_returns_path(self, mock_get_client):
+    async def test_upload_file_writes_and_returns_path(self, tmp_path):
+        import app.documents.storage as storage_module
         from app.documents.storage import upload_file
 
-        mock_client = MagicMock()
-        mock_client.storage.from_().upload.return_value = MagicMock()
-        mock_get_client.return_value = mock_client
+        with patch.object(storage_module.settings, "storage_dir", str(tmp_path)):
+            path = await upload_file(b"image-bytes", "nic.jpg", "user-1", "case-1")
 
-        path = await upload_file(b"image-bytes", "nic.jpg", "user-1", "case-1")
+            assert path.startswith("user-1/case-1/")
+            assert (tmp_path / path).read_bytes() == b"image-bytes"
 
-        assert "user-1" in path
-        assert "case-1" in path
-        mock_client.storage.from_().upload.assert_called_once()
-
-    @patch("app.documents.storage._get_client")
-    @patch.dict(
-        "os.environ",
-        {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_SERVICE_KEY": "test-key"},
-    )
     @pytest.mark.asyncio
-    async def test_get_signed_url(self, mock_get_client):
-        from app.documents.storage import get_signed_url
-
-        mock_client = MagicMock()
-        mock_client.storage.from_().create_signed_url.return_value = {
-            "signedURL": "https://supabase.co/signed?token=abc"
-        }
-        mock_get_client.return_value = mock_client
-
-        url = await get_signed_url("user-1/case-1/abc_nic.jpg")
-
-        assert url.startswith("https://")
-        assert "signed" in url
-
-    @patch("app.documents.storage._get_client")
-    @patch.dict(
-        "os.environ",
-        {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_SERVICE_KEY": "test-key"},
-    )
-    @pytest.mark.asyncio
-    async def test_delete_file_calls_remove(self, mock_get_client):
-        from app.documents.storage import delete_file
-
-        mock_client = MagicMock()
-        mock_client.storage.from_().remove.return_value = MagicMock()
-        mock_get_client.return_value = mock_client
-
-        await delete_file("user-1/case-1/abc_nic.jpg")
-
-        mock_client.storage.from_().remove.assert_called_once_with(
-            ["user-1/case-1/abc_nic.jpg"]
-        )
-
-    @patch.dict("os.environ", {}, clear=True)
-    @pytest.mark.asyncio
-    async def test_upload_raises_when_no_config(self):
+    async def test_get_signed_url_for_existing_file(self, tmp_path):
         import app.documents.storage as storage_module
+        from app.documents.storage import get_signed_url, upload_file
 
-        storage_module._supabase_client = None  # reset singleton
+        with patch.object(storage_module.settings, "storage_dir", str(tmp_path)):
+            path = await upload_file(b"x", "nic.jpg", "user-1", "case-1")
+            url = await get_signed_url(path)
 
-        from app.documents.storage import StorageConfigError, upload_file
+        assert url.startswith("file://")
+        assert "nic.jpg" in url
 
-        with pytest.raises(StorageConfigError):
-            await upload_file(b"bytes", "nic.jpg", "user-1", "case-1")
+    @pytest.mark.asyncio
+    async def test_delete_file_removes_file(self, tmp_path):
+        import app.documents.storage as storage_module
+        from app.documents.storage import delete_file, upload_file
+
+        with patch.object(storage_module.settings, "storage_dir", str(tmp_path)):
+            path = await upload_file(b"x", "nic.jpg", "user-1", "case-1")
+            assert (tmp_path / path).exists()
+
+            await delete_file(path)
+            assert not (tmp_path / path).exists()
+
+    @pytest.mark.asyncio
+    async def test_signed_url_raises_for_missing_file(self, tmp_path):
+        import app.documents.storage as storage_module
+        from app.documents.storage import StorageSignedUrlError, get_signed_url
+
+        with patch.object(storage_module.settings, "storage_dir", str(tmp_path)):
+            with pytest.raises(StorageSignedUrlError):
+                await get_signed_url("user-1/case-1/does-not-exist.jpg")
